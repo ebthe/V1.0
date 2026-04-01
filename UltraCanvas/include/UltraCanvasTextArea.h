@@ -1,0 +1,699 @@
+// UltraCanvasTextArea.h
+// Advanced text area component with syntax highlighting and full UTF-8 support
+// Version: 3.1.0
+// Last Modified: 2026-02-02
+// Author: UltraCanvas Framework
+
+#pragma once
+
+#include "UltraCanvasUI.h"
+#include "UltraCanvasEvent.h"
+#include "UltraCanvasCommonTypes.h"
+#include "UltraCanvasRenderContext.h"
+#include <string>
+#include <vector>
+#include <functional>
+#include <memory>
+#include <utility>
+#include <chrono>
+#include <cstdint>
+#include <unordered_map>
+
+namespace UltraCanvas {
+
+    // Forward declarations
+    class SyntaxTokenizer;
+    enum class TokenType;
+
+    // ===== HIT RECT FOR CLICKABLE ELEMENTS =====
+    // Tracks clickable regions for links and images
+    struct MarkdownHitRect {
+        Rect2Di bounds;
+        std::string url;
+        std::string altText;
+        bool isImage = false;
+        bool isAbbreviation = false;
+        bool isFootnote = false;
+        bool isAnchorReturn = false;   // ↩ return icon on {#id} headings — scrolls back to jump source
+    };
+
+// Syntax highlighting mode
+    struct TokenStyle {
+        Color color = Color(0, 0, 0);
+        bool bold = false;
+        bool italic = false;
+        bool underline = false;
+
+        TokenStyle() = default;
+
+        TokenStyle(const Color &c, bool b = false, bool i = false, bool u = false)
+                : color(c), bold(b), italic(i), underline(u) {}
+    };
+
+// Text area style structure
+    struct TextAreaStyle {
+        // Font properties
+        FontStyle fontStyle;
+        FontStyle fixedFontStyle;
+        float lineHeight;
+        Color fontColor;
+
+        // Background and borders
+        Color backgroundColor;
+        Color borderColor;
+        int borderWidth;
+        int padding;
+
+        // Selection and cursor
+        Color selectionColor;
+        Color currentLineHighlightColor;
+        Color cursorColor;
+
+        // Line numbers
+        bool showLineNumbers;
+        Color lineNumbersColor;
+        Color lineNumbersBackgroundColor;
+
+        // Current line highlighting
+        Color currentLineColor;
+
+        // Syntax highlighting mode
+        bool highlightSyntax;
+
+        Color scrollbarTrackColor;
+        Color scrollbarColor;
+
+        // Syntax highlighting colors
+        struct TokenStyles {
+            TokenStyle keywordStyle;
+            TokenStyle typeStyle;
+            TokenStyle functionStyle;
+            TokenStyle numberStyle;
+            TokenStyle stringStyle;
+            TokenStyle characterStyle;
+            TokenStyle commentStyle;
+            TokenStyle operatorStyle;
+            TokenStyle punctuationStyle;
+            TokenStyle preprocessorStyle;
+            TokenStyle constantStyle;
+            TokenStyle identifierStyle;
+            TokenStyle builtinStyle;
+            TokenStyle assemblyStyle;
+            TokenStyle registerStyle;
+            TokenStyle defaultStyle;
+        } tokenStyles;
+    };
+
+// Line ending type
+    enum class LineEndingType {
+        LF,     // Unix/macOS (\n)
+        CRLF,   // Windows (\r\n)
+        CR      // Classic Mac OS (\r)
+    };
+
+// Editing mode for text area (mutually exclusive)
+    enum class TextAreaEditingMode {
+        PlainText,      // Default text editing (with optional syntax highlighting)
+        MarkdownHybrid, // Hybrid markdown rendering
+        Hex             // Hex editor mode
+    };
+
+// Text area control with integrated syntax highlighting and full UTF-8 support
+    class UltraCanvasTextArea : public UltraCanvasUIElement {
+    public:
+        // Constructor and destructor
+        UltraCanvasTextArea(const std::string& name, int id, int x, int y, int width, int height);
+        virtual ~UltraCanvasTextArea();
+
+        bool AcceptsFocus() const override { return true; }
+        // Render method
+        virtual void Render(IRenderContext* ctx) override;
+
+        // Override SetBounds to trigger layout recalculation on resize
+        void SetBounds(const Rect2Di& b) override {
+            if (b.width != GetWidth() || b.height != GetHeight()) {
+                isNeedRecalculateVisibleArea = true;
+            }
+            UltraCanvasUIElement::SetBounds(b);
+        }
+
+        // Event handling
+        virtual bool OnEvent(const UCEvent& event) override;
+
+        void Invalidate();
+
+        // Text manipulation - now UTF-8 aware
+        void SetText(const std::string& text, bool runNotifications = true);
+        std::string GetText() const;
+        void InsertText(const std::string& text);
+        void InsertCodepoint(char32_t codepoint);
+        void InsertNewLine();
+        void InsertTab();
+        void DeleteCharacterBackward();  // Delete one grapheme cluster backward
+        void DeleteCharacterForward();   // Delete one grapheme cluster forward
+        void DeleteSelection();
+        void Clear() { SetText(""); }
+
+        // Legacy single-byte insert (for ASCII only)
+        void InsertCharacter(char ch);
+
+        // Cursor movement - now grapheme-aware
+        void MoveCursorLeft(bool selecting = false);
+        void MoveCursorRight(bool selecting = false);
+        void MoveCursorWordLeft(bool selecting = false);
+        void MoveCursorWordRight(bool selecting = false);
+        void MoveCursorUp(bool selecting = false);
+        void MoveCursorDown(bool selecting = false);        
+        void MoveCursorToLineStart(bool selecting = false);
+        void MoveCursorToLineEnd(bool selecting = false);
+        void MoveCursorToStart(bool selecting = false);
+        void MoveCursorToEnd(bool selecting = false);
+        void MoveCursorPageDown(bool selecting = false);
+        void MoveCursorPageUp(bool selecting = false);
+        void SetCursorPosition(int graphemePosition);
+        int GetCursorPosition() const { return cursorGraphemePosition; }
+
+        // Selection - grapheme-based positions
+        void SelectAll();
+        void SelectLine(int lineIndex);
+        void SelectWord();
+        void SetSelection(int startGrapheme, int endGrapheme);
+        void ClearSelection();
+        bool HasSelection() const;
+        std::string GetSelectedText() const;
+        int GetSelectionMinGrapheme() const;
+
+        // Clipboard operations
+        void CopySelection();
+        void CutSelection();
+        void PasteClipboard();
+
+        // Syntax highlighting
+        void SetHighlightSyntax(bool);
+        bool GetHighlightSyntax() const { return style.highlightSyntax; }
+        void SetProgrammingLanguage(const std::string& language);
+        bool SetProgrammingLanguageByExtension(const std::string& extension);
+        const std::string GetCurrentProgrammingLanguage();
+        std::vector<std::string> GetSupportedLanguages();
+
+        void SetSyntaxTheme(const std::string& theme);
+        void UpdateSyntaxHighlighting();
+
+        // Theme application
+        void ApplyDarkTheme();
+        void ApplyLightTheme();
+        void ApplyCustomTheme(const TextAreaStyle& customStyle);
+
+        // Quick style applications
+        void ApplyCodeStyle(const std::string& language);
+        void ApplyDarkCodeStyle(const std::string& language);
+        void ApplyPlainTextStyle();
+
+        // Line operations - line indices remain integer-based
+        void GoToLine(int lineNumber);
+        int GetCurrentLine() const;
+        int GetCurrentColumn() const;  // Returns grapheme column
+        int GetLineCount() const;
+        std::string GetLine(int lineIndex) const;
+        void SetLine(int lineIndex, const std::string& text);
+
+        // Search and replace
+        void SetTextToFind(const std::string& searchText, bool caseSensitive = false);
+        void FindNext();
+        void FindPrevious();
+        void ReplaceText(const std::string& findText, const std::string& replaceText, bool all = false);
+        void HighlightMatches(const std::string& searchText);
+        void ClearHighlights();
+
+        /// Count total occurrences of search text in document
+        /// @return Total number of matches
+        int CountMatches(const std::string& searchText, bool caseSensitive = false) const;
+
+        /// Get the index (1-based) of the current match among all matches
+        /// @return Current match index (1-based), or 0 if no current match
+        int GetCurrentMatchIndex(const std::string& searchText, bool caseSensitive = false) const;
+
+        // Undo/Redo (basic support)
+        void Undo();
+        void Redo();
+        bool CanUndo() const;
+        bool CanRedo() const;
+
+        // Properties
+        void SetReadOnly(bool readOnly) { isReadOnly = readOnly; isNeedRecalculateVisibleArea = true; RequestRedraw(); }
+        bool IsReadOnly() const { return isReadOnly; }
+
+        void SetWordWrap(bool wrap);
+        bool GetWordWrap() const { return wordWrap; }
+
+        void SetHighlightCurrentLine(bool highlight) { highlightCurrentLine = highlight; isNeedRecalculateVisibleArea = true; RequestRedraw(); }
+        bool GetHighlightCurrentLine() const { return highlightCurrentLine; }
+
+        void SetShowLineNumbers(bool show) { style.showLineNumbers = show; isNeedRecalculateVisibleArea = true; RequestRedraw(); }
+        bool GetShowLineNumbers() const { return style.showLineNumbers; }
+
+        void SetTabSize(int size) { tabSize = size; isNeedRecalculateVisibleArea = true; RequestRedraw(); }
+        int GetTabSize() const { return tabSize; }
+
+        std::pair<int, int> GetLineColumnFromPosition(int graphemePosition) const;
+
+        // Style access
+        void SetStyle(const TextAreaStyle& newStyle) { style = newStyle; }
+        TextAreaStyle& GetStyle() { return style; }
+        const TextAreaStyle& GetStyle() const { return style; }
+
+        // Font settings
+        void SetFont(const std::string& family, float size) { style.fontStyle.fontFamily = family, style.fontStyle.fontSize = size; isNeedRecalculateVisibleArea = true; RequestRedraw(); }
+        void SetFontFamily(const std::string& family) { style.fontStyle.fontFamily = family; isNeedRecalculateVisibleArea = true; RequestRedraw(); }
+        const std::string& GetFontFamily() { return style.fontStyle.fontFamily; }
+        void SetFontSize(float size) { style.fontStyle.fontSize = size; isNeedRecalculateVisibleArea = true; RequestRedraw(); }
+        float GetFontSize() { return style.fontStyle.fontSize; }
+
+        // Color settings
+        void SetTextColor(const Color& color) { style.fontColor = color;  RequestRedraw(); }
+        void SetBackgroundColor(const Color& color) { style.backgroundColor = color; RequestRedraw(); }
+        void SetSelectionColor(const Color& color) { style.selectionColor = color; RequestRedraw(); }
+        void SetCursorColor(const Color& color) { style.cursorColor = color; RequestRedraw(); }
+
+        // Line ending
+        void SetLineEnding(LineEndingType type);
+        LineEndingType GetLineEnding() const { return lineEndingType; }
+        static LineEndingType DetectLineEnding(const std::string& text);
+        static std::string LineEndingToString(LineEndingType type);
+        static std::string LineEndingSequence(LineEndingType type);
+        static LineEndingType GetSystemDefaultLineEnding();
+
+        using LineEndingChangedCallback = std::function<void(LineEndingType)>;
+        LineEndingChangedCallback onLineEndingChanged;
+
+        // Scrolling
+        void ScrollTo(int line);
+        void ScrollUp(int lines = 1);
+        void ScrollDown(int lines = 1);
+        void ScrollLeft(int chars = 1);
+        void ScrollRight(int chars = 1);
+        void EnsureCursorVisible();
+        void SetFirstVisibleLine(int line);
+
+        // Callbacks
+        using TextChangedCallback = std::function<void(const std::string&)>;
+        using CursorPositionChangedCallback = std::function<void(int line, int column)>;
+        using SelectionChangedCallback = std::function<void(int start, int end)>;
+
+        void SetOnTextChanged(TextChangedCallback callback) { onTextChanged = callback; }
+        void SetOnCursorPositionChanged(CursorPositionChangedCallback callback) { onCursorPositionChanged = callback; }
+        void SetOnSelectionChanged(SelectionChangedCallback callback) { onSelectionChanged = callback; }
+
+        // Auto-completion support
+        void ShowAutoComplete(const std::vector<std::string>& suggestions);
+        void HideAutoComplete();
+        void AcceptAutoComplete();
+
+        // Bracket matching
+        void HighlightMatchingBrackets();
+        void JumpToMatchingBracket();
+
+        // Indentation
+        void IndentSelection();
+        void UnindentSelection();
+        void AutoIndentLine(int lineIndex);
+
+        // Comments
+        void ToggleLineComment();
+        void ToggleBlockComment();
+
+        // Bookmarks
+        void ToggleBookmark(int lineIndex);
+        void NextBookmark();
+        void PreviousBookmark();
+        void ClearAllBookmarks();
+
+        // Error markers
+        void AddErrorMarker(int lineIndex, const std::string& message);
+        void AddWarningMarker(int lineIndex, const std::string& message);
+        void ClearMarkers();
+
+
+        // Callbacks
+        TextChangedCallback onTextChanged;
+        CursorPositionChangedCallback onCursorPositionChanged;
+        SelectionChangedCallback onSelectionChanged;
+
+    protected:
+        // Drawing methods
+        void DrawBackground(IRenderContext* context);
+        void DrawBorder(IRenderContext* context);
+        void DrawLineNumbers(IRenderContext* context);
+        void DrawText(IRenderContext* context);
+        void DrawPlainText(IRenderContext* context);
+        void DrawHighlightedText(IRenderContext* context);
+        void DrawSelection(IRenderContext* context);
+        void DrawSearchHighlights(IRenderContext* context);
+        void DrawCursor(IRenderContext* context);
+        void DrawScrollbars(IRenderContext* context);
+        void DrawAutoComplete(IRenderContext* context);
+        void DrawMarkers(IRenderContext* context);
+
+        // Event handlers
+        bool HandleMouseDown(const UCEvent& event);
+        bool HandleMouseDoubleClick(const UCEvent& event);
+        bool HandleMouseTripleClick(const UCEvent& event);
+        bool HandleMouseMove(const UCEvent& event);
+        bool HandleMouseUp(const UCEvent &event);
+        bool HandleMouseDrag(const UCEvent& event);
+        bool HandleMouseWheel(const UCEvent& event);
+        bool HandleKeyDown(const UCEvent& event);
+
+        int MeasureTextWidth(const std::string& txt) const;
+        
+        // Helper methods - updated for UTF-8 support
+        int GetPositionFromLineColumn(int line, int graphemeColumn) const;
+        std::pair<int, int> GetLineColumnFromPoint(int x, int y) const;
+        void CalculateVisibleArea();
+        void RecalculateDisplayLines();
+        int CalculateLineNumbersWidth(IRenderContext* ctx);
+        int GetDisplayLineForCursor(int logicalLine, int graphemeCol) const;
+        int GetDisplayLineCount() const;
+        void RebuildText();
+        int GetMaxLineLength() const;
+        int GetVisibleCharactersPerLine() const;
+        const TokenStyle& GetStyleForTokenType(TokenType type) const;
+
+        // UTF-8 conversion helpers
+        size_t GraphemeToByteOffset(int lineIndex, int graphemeColumn) const;
+        int ByteToGraphemeColumn(int lineIndex, size_t byteOffset) const;
+        int GetLineGraphemeCount(int lineIndex) const;
+
+        // Mouse-to-text position helper
+        int GetGraphemePositionFromPoint(int mouseX, int mouseY, int& outLine, int& outCol) const;
+
+        // Initialization
+        void ApplyDefaultStyle();
+        bool IsNeedVerticalScrollbar();
+        bool IsNeedHorizontalScrollbar();
+        int GetMaxLineWidth();
+        
+        // State management
+        void SaveState();
+
+    private:
+        // Text data - std::string with GLib g_utf8_* for UTF-8 handling
+        std::string textContent;
+        std::vector<std::string> lines;
+
+        // Word wrap display line mapping
+        struct DisplayLine {
+            int logicalLine;    // index into lines[]
+            int startGrapheme;  // start grapheme offset within logical line
+            int endGrapheme;    // end grapheme offset (exclusive)
+        };
+        std::vector<DisplayLine> displayLines;
+
+        // Cursor and selection - grapheme-based positions
+        int cursorGraphemePosition;            // Cursor position in graphemes from start
+        int selectionStartGrapheme;            // Selection start in graphemes (-1 if no selection)
+        int selectionEndGrapheme;              // Selection end in graphemes (-1 if no selection)
+        int computedLineHeight = 12;
+        int computedLineNumbersWidth = 40;
+
+        // Scrolling
+        int horizontalScrollOffset;
+        int verticalScrollOffset;
+        int firstVisibleLine;
+        int maxVisibleLines;
+        int maxLineWidth;
+        Rect2Di visibleTextArea;
+        Rect2Di horizontalScrollThumb;
+        Rect2Di verticalScrollThumb;
+        Point2Di dragStartOffset;
+        bool isDraggingHorizontalThumb = false;
+        bool isDraggingVerticalThumb = false;
+
+        // Mouse text selection state
+        bool isSelectingText = false;
+        int selectionAnchorGrapheme = -1;
+
+        // Click counting for double/triple click detection
+        int clickCount = 0;
+        std::chrono::steady_clock::time_point lastClickTime;
+        int lastClickX = 0;
+        int lastClickY = 0;
+        static constexpr int MultiClickDistanceThreshold = 5;
+        static constexpr int MultiClickTimeThresholdMs = 400;
+
+        // Cursor animation
+        double cursorBlinkTime;
+        bool cursorVisible;
+
+        // Properties
+        bool isNeedRecalculateVisibleArea;
+        bool isReadOnly;
+        bool wordWrap;
+        bool highlightCurrentLine;
+        bool needFirstVisibleLineFixup = false; // Set after SetWordWrap toggle
+        int currentLineIndex;
+        int tabSize = 4;
+
+        // Style
+        TextAreaStyle style;
+
+        // Syntax highlighter
+        std::unique_ptr<SyntaxTokenizer> syntaxTokenizer;
+
+        // Cached syntax tokenizer for markdown code block highlighting
+        std::unique_ptr<SyntaxTokenizer> codeBlockTokenizer;
+        std::string codeBlockTokenizerLang;
+
+        // Search state
+        std::string lastSearchText;
+        int lastSearchPosition;
+        bool lastSearchCaseSensitive;
+        
+        // Search highlights (grapheme positions: start, end)
+        std::vector<std::pair<int, int>> searchHighlights;
+
+        // Undo/Redo stacks
+        struct TextState {
+            std::string text;
+            int cursorGraphemePosition;
+            int selectionStartGrapheme;
+            int selectionEndGrapheme;
+        };
+        std::vector<TextState> undoStack;
+        std::vector<TextState> redoStack;
+        const size_t maxUndoStackSize = 100;
+
+        // Line ending type
+        LineEndingType lineEndingType = GetSystemDefaultLineEnding();
+
+        // Bookmarks
+        std::vector<int> bookmarks;
+
+        // Error/Warning markers
+        struct Marker {
+            enum Type { Error, Warning, Info };
+            Type type;
+            int line;
+            std::string message;
+        };
+        std::vector<Marker> markers;
+        
+        // Cache for total grapheme count
+        mutable int cachedTotalGraphemes = -1;
+        void InvalidateGraphemeCache() { cachedTotalGraphemes = -1; }
+        int GetTotalGraphemeCount() const;
+
+    public:
+        // Markdown interaction callbacks
+        using MarkdownLinkClickCallback = std::function<void(const std::string& url)>;
+        using MarkdownImageClickCallback = std::function<void(const std::string& imagePath, const std::string& altText)>;
+        MarkdownLinkClickCallback onMarkdownLinkClick;
+        MarkdownImageClickCallback onMarkdownImageClick;
+        /**
+         * @brief Check if hybrid markdown mode is enabled
+         * @return true if hybrid markdown mode is active
+         */
+        bool IsMarkdownHybridMode() const { return editingMode == TextAreaEditingMode::MarkdownHybrid; }
+        /**
+         * @brief Handle click on markdown link or image
+         * @param mouseX Mouse X coordinate
+         * @param mouseY Mouse Y coordinate
+         * @return true if a clickable markdown element was hit
+         */
+        bool HandleMarkdownClick(int mouseX, int mouseY);
+
+        /**
+         * @brief Handle hover over markdown elements (updates cursor)
+         * @param mouseX Mouse X coordinate
+         * @param mouseY Mouse Y coordinate
+         * @return true if hovering over a clickable element
+         */
+        bool HandleMarkdownHover(int mouseX, int mouseY);
+
+        void SetDocumentFilePath(const std::string& path) { documentFilePath = path; }
+        std::string GetDocumentFilePath() const { return documentFilePath; }
+
+        // ===== EDITING MODE PUBLIC API =====
+        void SetEditingMode(TextAreaEditingMode mode);
+        bool IsHexMode() const { return editingMode == TextAreaEditingMode::Hex; }
+        TextAreaEditingMode GetEditingMode() const { return editingMode; }
+        void SetRawBytes(const std::vector<uint8_t>& bytes);
+        std::vector<uint8_t> GetRawBytes() const;
+        int GetHexCursorByteOffset() const { return hexCursorByteOffset; }
+
+    protected:
+        /**
+         * @brief Draw text with hybrid markdown rendering
+         * 
+         * Renders current line as syntax-highlighted raw text,
+         * and all other lines as formatted markdown.
+         */
+        void DrawMarkdownHybridText(IRenderContext* context);
+        
+        /**
+         * @brief Check if a line is a markdown list item
+         * @param line Line to check
+         * @return true if line starts with list marker
+         */
+        bool IsMarkdownListItem(const std::string& line) const;
+        
+        /**
+         * @brief Trim whitespace from string
+         * @param str String to trim
+         * @return Trimmed string
+         */
+        std::string TrimWhitespace(const std::string& str) const;
+
+        // ===== HEX MODE PROTECTED METHODS =====
+        // Hex rendering
+        void DrawHexView(IRenderContext* ctx);
+        void DrawHexAddresses(IRenderContext* ctx);
+        void DrawHexBytes(IRenderContext* ctx);
+        void DrawHexAscii(IRenderContext* ctx);
+        void DrawHexSelection(IRenderContext* ctx);
+        void DrawHexCrossHighlight(IRenderContext* ctx);
+        void DrawHexCursor(IRenderContext* ctx);
+        void DrawHexCurrentRowHighlight(IRenderContext* ctx);
+        void CalculateHexLayout();
+
+        // Hex events
+        bool HandleHexKeyDown(const UCEvent& event);
+        bool HandleHexMouseDown(const UCEvent& event);
+        bool HandleHexMouseMove(const UCEvent& event);
+
+        // Hex editing
+        void HexOverwriteNibble(int nibbleValue);
+        void HexOverwriteAscii(char ch);
+        void HexDeleteByte();
+        void HexDeleteByteBackward();
+        void HexSaveState();
+        void HexUndo();
+        void HexRedo();
+
+        // Hex cursor
+        void HexMoveCursorLeft(bool selecting = false);
+        void HexMoveCursorRight(bool selecting = false);
+        void HexMoveCursorUp(bool selecting = false);
+        void HexMoveCursorDown(bool selecting = false);
+        void HexMoveCursorPageUp(bool selecting = false);
+        void HexMoveCursorPageDown(bool selecting = false);
+        void HexMoveCursorToRowStart(bool selecting = false);
+        void HexMoveCursorToRowEnd(bool selecting = false);
+        void HexEnsureCursorVisible();
+
+        // Hex helpers
+        int HexGetRowForByte(int byteOffset) const;
+        int HexGetColumnForByte(int byteOffset) const;
+        std::pair<int,int> HexHitTestPoint(int mouseX, int mouseY) const;
+        static std::string HexFormatAddress(int offset);
+        static std::string HexFormatByte(uint8_t byte);
+        static char HexPrintableChar(uint8_t byte);
+
+    private:
+        // Editing mode (PlainText, MarkdownHybrid, Hex)
+        TextAreaEditingMode editingMode = TextAreaEditingMode::PlainText;
+        // Markdown clickable hit regions (rebuilt each render frame)
+        std::vector<MarkdownHitRect> markdownHitRects;
+        // Abbreviation definitions: abbreviation -> expansion text
+        std::unordered_map<std::string, std::string> markdownAbbreviations;
+        // Per-logical-line flag: true if line is an abbreviation definition (hidden from rendering)
+        std::vector<bool> isAbbreviationDefinitionLine;
+        // Footnote definitions: label -> content text
+        std::unordered_map<std::string, std::string> markdownFootnotes;
+        // Per-logical-line flag: true if line is a footnote definition (hidden from rendering)
+        std::vector<bool> isFootnoteDefinitionLine;
+        // Markdown anchor registry: anchor ID -> logical line number (rebuilt each render frame)
+        std::unordered_map<std::string, int> markdownAnchors;
+        // Backlink map: anchor ID -> source logical line (only for anchors with exactly 1 reference)
+        std::unordered_map<std::string, int> markdownAnchorBacklinks;
+        // Per-logical-line flag: true if line is a definition list term (rendered bold)
+        std::vector<bool> isDefinitionTermLine;
+        // Per-logical-line flag: true if line is hidden (lazy continuation merged into definition)
+        std::vector<bool> isDefinitionHiddenLine;
+        // Per-logical-line flag: true if line is a continuation paragraph of a definition
+        std::vector<bool> isDefinitionContinuationLine;
+        // Per-logical-line: for ": " lines, the full merged text (including lazy continuations)
+        std::vector<std::string> definitionMergedText;
+        // Path of the currently loaded document (for resolving relative image paths)
+        std::string documentFilePath;
+        // Per-display-line cumulative Y offset from block images (rebuilt each frame)
+        std::vector<int> markdownLineYOffsets;
+
+        // ===== HEX MODE STATE =====
+        std::vector<uint8_t> hexBuffer;
+        int hexCursorByteOffset = 0;
+        bool hexCursorInAsciiPanel = false;   // false=hex panel, true=ASCII panel
+        int hexCursorNibble = 0;              // 0=high, 1=low nibble (hex panel only)
+        int hexSelectionStart = -1;
+        int hexSelectionEnd = -1;
+        bool hexIsSelectingWithMouse = false;
+        int hexSelectionAnchor = -1;
+
+        // Hex layout (recomputed on resize)
+        int hexBytesPerRow = 16;
+        int hexAddressWidth = 0;
+        int hexByteWidth = 0;
+        int hexAsciiCharWidth = 0;
+        int hexPanelStartX = 0;
+        int hexAsciiPanelStartX = 0;
+        int hexRowHeight = 0;
+        int hexTotalRows = 0;
+        int hexFirstVisibleRow = 0;
+        int hexMaxVisibleRows = 0;
+        Rect2Di hexVisibleArea;
+
+        // Hex undo
+        struct HexState {
+            std::vector<uint8_t> data;
+            int cursorByteOffset;
+            bool cursorInAsciiPanel;
+            int selectionStart;
+            int selectionEnd;
+        };
+        std::vector<HexState> hexUndoStack;
+        std::vector<HexState> hexRedoStack;
+
+    };
+
+// Factory functions for quick creation
+    std::shared_ptr<UltraCanvasTextArea> CreateCodeEditor(
+            const std::string& name, int id, int x, int y, int width, int height,
+            const std::string& language = "C++");
+
+    std::shared_ptr<UltraCanvasTextArea> CreateDarkCodeEditor(
+            const std::string& name, int id, int x, int y, int width, int height,
+            const std::string& language = "C++");
+
+    std::shared_ptr<UltraCanvasTextArea> CreatePlainTextEditor(
+            const std::string& name, int id, int x, int y, int width, int height);
+
+    std::shared_ptr<UltraCanvasTextArea> CreateMarkdownEditor(
+            const std::string& name, int id, int x, int y, int width, int height);
+
+    std::shared_ptr<UltraCanvasTextArea> CreateJSONEditor(
+            const std::string& name, int id, int x, int y, int width, int height);
+
+    std::shared_ptr<UltraCanvasTextArea> CreateXMLEditor(
+            const std::string& name, int id, int x, int y, int width, int height);
+
+} // namespace UltraCanvas

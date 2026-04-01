@@ -1,0 +1,1584 @@
+// UltraCanvasTextInput.h
+// Advanced text input component with validation, formatting, and feedback systems
+// Version: 1.1.0
+// Last Modified: 2025-01-06
+// Author: UltraCanvas Framework
+
+#include "UltraCanvasTextInput.h"
+#include <string>
+#include <vector>
+#include <functional>
+#include <regex>
+#include <memory>
+#include <chrono>
+
+namespace UltraCanvas {
+
+    UltraCanvasTextInput::UltraCanvasTextInput(const std::string &id, long uid, long x, long y, long w, long h)
+            : UltraCanvasUIElement(id, uid, x, y, w, h)
+            , text("")
+            , placeholderText("")
+            , inputType(TextInputType::Text)
+            , readOnly(false)
+            , passwordMode(false)
+            , maxLength(-1)
+            , lastValidationResult(ValidationResult::Valid())
+            , showValidationState(true)
+            , validateOnChange(true)
+            , validateOnBlur(true)
+            , formatter(TextFormatter::NoFormat())
+            , displayText("")
+            , style(TextInputStyle::Default())
+            , caretPosition(0)
+            , selectionStart(0)
+            , selectionEnd(0)
+            , hasSelection(false)
+            , isCaretVisible(true)
+            , caretBlinkTimer(0.0f)
+            , scrollOffset(0.0f)
+            , maxScrollOffset(0.0f)
+            , lastMeasuredSize(0.0f)
+            , maxUndoStates(50)
+            , isDragging(false)  {
+        textWidthCache.clear();
+        lastMeasuredFont.clear();
+        SetMouseCursor(UCMouseCursor::Text);
+    }
+
+    void UltraCanvasTextInput::TextChanged() {
+        if (onTextChanged) onTextChanged(text);
+    }
+
+    void UltraCanvasTextInput::SetText(const std::string &newText, bool callOnTextChanged) {
+        if (readOnly) return;
+
+        SaveState();  // For undo
+
+        text = newText;
+        displayText = formatter.formatFunction ? formatter.formatFunction(text) : text;
+
+        // Clamp caret position
+        caretPosition = std::min(caretPosition, text.length());
+
+        // Clear selection if it's now invalid
+        if (selectionEnd > text.length()) {
+            ClearSelection();
+        }
+
+        // Validate if needed
+        if (validateOnChange) {
+            Validate();
+        }
+
+        UpdateScrollOffset();
+
+        if (callOnTextChanged) TextChanged();
+    }
+
+    void UltraCanvasTextInput::SetInputType(TextInputType type) {
+        inputType = type;
+
+        // Configure based on type
+        switch (type) {
+            case TextInputType::Password:
+                passwordMode = true;
+                break;
+            case TextInputType::Email:
+                AddValidationRule(ValidationRule::Email());
+                break;
+            case TextInputType::Phone:
+                SetFormatter(TextFormatter::Phone());
+                AddValidationRule(ValidationRule::Phone());
+                break;
+            case TextInputType::Number:
+            case TextInputType::Integer:
+            case TextInputType::Decimal:
+                AddValidationRule(ValidationRule::Numeric());
+                break;
+            case TextInputType::Currency:
+                SetFormatter(TextFormatter::Currency());
+                AddValidationRule(ValidationRule::Numeric());
+                break;
+            case TextInputType::Date:
+                SetFormatter(TextFormatter::Date());
+                break;
+            default:
+                break;
+        }
+    }
+
+    void UltraCanvasTextInput::SetReadOnly(bool readonly) {
+        readOnly = readonly;
+        if (readonly) {
+            ClearSelection();
+        }
+    }
+
+    void UltraCanvasTextInput::SetMaxLength(int length) {
+        maxLength = length;
+        if (maxLength > 0 && static_cast<int>(text.length()) > maxLength) {
+            SetText(text.substr(0, maxLength));
+        }
+    }
+
+    ValidationResult UltraCanvasTextInput::Validate() {
+        ValidationResult result = ValidationResult::Valid();
+
+        // Check all rules in priority order
+        std::sort(validationRules.begin(), validationRules.end(),
+                  [](const ValidationRule& a, const ValidationRule& b) {
+                      return a.priority > b.priority;
+                  });
+
+        for (const auto& rule : validationRules) {
+            if (!rule.validator(text)) {
+                result = ValidationResult::Invalid(rule.errorMessage, rule.name);
+                break;
+            }
+        }
+
+        lastValidationResult = result;
+
+        if (onValidationChanged) onValidationChanged(result);
+
+        return result;
+    }
+
+    void UltraCanvasTextInput::SetFormatter(const TextFormatter &textFormatter) {
+        formatter = textFormatter;
+        if (!placeholderText.empty() && !formatter.placeholder.empty()) {
+            placeholderText = formatter.placeholder;
+        }
+
+        // Reformat current text
+        displayText = formatter.formatFunction ? formatter.formatFunction(text) : text;
+    }
+
+    void UltraCanvasTextInput::SetSelection(size_t start, size_t end) {
+        selectionStart = std::min(start, text.length());
+        selectionEnd = std::min(end, text.length());
+
+        if (selectionStart > selectionEnd) {
+            std::swap(selectionStart, selectionEnd);
+        }
+
+        hasSelection = (selectionStart != selectionEnd);
+        caretPosition = selectionEnd;
+
+        UpdateScrollOffset();
+
+        if (onSelectionChanged) onSelectionChanged(selectionStart, selectionEnd);
+    }
+
+    std::string UltraCanvasTextInput::GetSelectedText() const {
+        if (!hasSelection) return "";
+        return text.substr(selectionStart, selectionEnd - selectionStart);
+    }
+
+    void UltraCanvasTextInput::SetCaretPosition(size_t position) {
+        caretPosition = std::min(position, text.length());
+        ClearSelection();
+        UpdateScrollOffset();
+    }
+
+    void UltraCanvasTextInput::Undo() {
+        if (undoStack.empty()) return;
+
+        // Save current state to redo stack
+        redoStack.emplace_back(text, caretPosition, selectionStart, selectionEnd);
+
+        // Restore previous state
+        const auto& state = undoStack.back();
+        text = state.text;
+        caretPosition = state.caretPosition;
+        selectionStart = state.selectionStart;
+        selectionEnd = state.selectionEnd;
+        hasSelection = (selectionStart != selectionEnd);
+
+        undoStack.pop_back();
+
+        // Reformat text
+        displayText = formatter.formatFunction ? formatter.formatFunction(text) : text;
+
+        UpdateScrollOffset();
+
+        TextChanged();
+    }
+
+    void UltraCanvasTextInput::Redo() {
+        if (redoStack.empty()) return;
+
+        // Save current state to undo stack
+        undoStack.emplace_back(text, caretPosition, selectionStart, selectionEnd);
+
+        // Restore next state
+        const auto& state = redoStack.back();
+        text = state.text;
+        caretPosition = state.caretPosition;
+        selectionStart = state.selectionStart;
+        selectionEnd = state.selectionEnd;
+        hasSelection = (selectionStart != selectionEnd);
+
+        redoStack.pop_back();
+
+        // Reformat text
+        displayText = formatter.formatFunction ? formatter.formatFunction(text) : text;
+
+        UpdateScrollOffset();
+
+        TextChanged();
+    }
+
+    void UltraCanvasTextInput::Render(IRenderContext* ctx) {
+        if (!IsVisible()) return;
+
+        ctx->PushState();
+
+        // Update caret blinking
+        UpdateCaretBlink();
+
+        // Get colors based on state
+        Color backgroundColor = GetBackgroundColor();
+        Color borderColor = GetBorderColor();
+        Color textColor = GetTextColor();
+
+        Rect2Di bounds = GetBounds();
+
+        // Draw background
+        ctx->DrawFilledRectangle(bounds, backgroundColor, style.borderWidth, style.borderColor);
+
+        // Get text area (excluding padding)
+        Rect2Df textArea = GetTextArea();
+        ctx->PushState();
+        // Set clipping for text area ONLY
+        ctx->ClipRect(textArea);
+
+        // Draw text content
+        if (!text.empty()) {
+            RenderText(textArea, textColor, ctx);
+        } else if (!placeholderText.empty() && !IsFocused()) {
+            RenderPlaceholder(textArea, ctx);
+        }
+
+        // Draw selection
+        if (HasSelection() && IsFocused()) {
+            RenderSelection(textArea, ctx);
+        }
+        ctx->PopState();
+        // CRITICAL: Clear clipping BEFORE drawing caret
+
+        // Draw caret WITHOUT clipping so it's always visible
+        if (IsFocused() && isCaretVisible && !HasSelection()) {
+            RenderCaret(textArea, ctx);
+        }
+
+        // Draw validation feedback
+        if (showValidationState && lastValidationResult.state != ValidationState::NoValidation) {
+            RenderValidationFeedback(bounds, ctx);
+        }
+
+        // Draw clear button
+        RenderClearButton(ctx);
+
+        ctx->PopState();
+    }
+
+    bool UltraCanvasTextInput::OnEvent(const UCEvent &event) {
+        if (IsDisabled() || !IsVisible()) return false;;
+
+        switch (event.type) {
+            case UCEventType::MouseDown:
+                return HandleMouseDown(event);
+
+            case UCEventType::MouseMove:
+                 return HandleMouseMove(event);
+
+            case UCEventType::MouseUp:
+                return HandleMouseUp(event);
+
+            case UCEventType::KeyDown:
+                return HandleKeyDown(event);
+
+            case UCEventType::FocusGained:
+                return HandleFocusGained(event);
+
+            case UCEventType::FocusLost:
+                return HandleFocusLost(event);
+        }
+        return false;
+    }
+
+    void UltraCanvasTextInput::SaveState() {
+        undoStack.emplace_back(text, caretPosition, selectionStart, selectionEnd);
+
+        // Limit undo stack size
+        if (static_cast<int>(undoStack.size()) > maxUndoStates) {
+            undoStack.erase(undoStack.begin());
+        }
+
+        // Clear redo stack when new state is saved
+        redoStack.clear();
+    }
+
+    void UltraCanvasTextInput::UpdateScrollOffset() {
+        auto ctx = GetRenderContext();
+        if (!ctx) return;
+
+        Rect2Df textArea = GetTextArea();
+        float caretX = GetCaretXPosition();
+
+        // Add some padding around caret for better UX
+        float caretPadding = 10.0f;
+
+        // Horizontal scrolling for both single-line and multiline
+        if (caretX < scrollOffset + caretPadding) {
+            scrollOffset = std::max(0.0f, caretX - caretPadding);
+        } else if (caretX > scrollOffset + textArea.width - caretPadding) {
+            scrollOffset = caretX - textArea.width + caretPadding;
+        }
+
+        // Ensure we don't scroll past the beginning
+        scrollOffset = std::max(0.0f, scrollOffset);
+
+        // For multiline, check current line width
+        if (inputType == TextInputType::Multiline) {
+            std::string displayText = GetDisplayText();
+            size_t lineStart = caretPosition;
+            while (lineStart > 0 && displayText[lineStart - 1] != '\n') {
+                lineStart--;
+            }
+
+            size_t lineEnd = displayText.find('\n', lineStart);
+            if (lineEnd == std::string::npos) {
+                lineEnd = displayText.length();
+            }
+
+            std::string currentLine = displayText.substr(lineStart, lineEnd - lineStart);
+
+            // Set text style for measurement
+            ctx->SetFontStyle(style.fontStyle);
+
+            float lineWidth = ctx->GetTextLineWidth(currentLine);
+            float maxScroll = std::max(0.0f, lineWidth - textArea.width + style.paddingRight);
+            scrollOffset = std::min(scrollOffset, maxScroll);
+        } else {
+            // Single line: check against total text width
+            std::string displayText = GetDisplayText();
+
+            // Set text style for measurement
+            ctx->SetFontStyle(style.fontStyle);
+
+            float totalTextWidth = ctx->GetTextLineWidth(displayText);
+            float maxScroll = std::max(0.0f, totalTextWidth - textArea.width + style.paddingRight);
+            scrollOffset = std::min(scrollOffset, maxScroll);
+        }
+        RequestRedraw();
+    }
+
+    bool UltraCanvasTextInput::IsClearButtonVisible() const {
+        return showClearButton && !text.empty() && !readOnly;
+    }
+
+    Rect2Di UltraCanvasTextInput::GetClearButtonBounds() const {
+        if (!IsClearButtonVisible()) return Rect2Di(0, 0, 0, 0);
+
+        Rect2Di bounds = GetBounds();
+
+        int rightOffset = style.paddingRight;
+        if (showValidationState &&
+            (lastValidationResult.state == ValidationState::Valid ||
+             lastValidationResult.state != ValidationState::Invalid)) {
+            rightOffset += 20;
+        }
+
+        int btnX = bounds.x + bounds.width - rightOffset - clearButtonSize - 2;
+        int btnY = bounds.y + (bounds.height - clearButtonSize) / 2;
+
+        return Rect2Di(btnX, btnY, clearButtonSize, clearButtonSize);
+    }
+
+    Rect2Df UltraCanvasTextInput::GetTextArea() const {
+        Rect2Di bounds = GetBounds();
+        int rightReduction = style.paddingRight;
+
+        if (showValidationState && (lastValidationResult.state == ValidationState::Valid || lastValidationResult.state != ValidationState::Invalid)) {
+            rightReduction += 20;
+        }
+
+        if (IsClearButtonVisible()) {
+            rightReduction += clearButtonSize + 4;
+        }
+
+        return Rect2Df(
+                bounds.x + style.paddingLeft,
+                bounds.y + style.paddingTop,
+                bounds.width - style.paddingLeft - rightReduction,
+                bounds.height - style.paddingTop - style.paddingBottom
+        );
+    }
+
+    void UltraCanvasTextInput::RenderText(const Rect2Df &area, const Color &color, IRenderContext* ctx) {
+        std::string renderText = passwordMode ?
+                                 std::string(text.length(), '*') : GetDisplayText();
+
+        if (renderText.empty()) return;
+
+        // Set text style
+        TextStyle textStyle;
+        ctx->SetFontStyle(style.fontStyle);
+        textStyle.alignment = style.textAlignment;
+        textStyle.verticalAlignement = TextVerticalAlignment::Middle;
+        ctx->SetTextStyle(textStyle);
+        ctx->SetTextPaint(color);
+
+        if (inputType == TextInputType::Multiline) {
+            // Start at baseline position
+            Point2Di textPos(area.x - scrollOffset, area.y);
+            RenderMultilineText(area, renderText, textPos, ctx);
+        } else {
+            // Match the baseline calculation used in GetCaretYPosition
+            float lineHeight = ctx->GetTextLineHeight(renderText);
+            float centeredY = area.y + (area.height - lineHeight) / 2.0f;
+            //float baselineY = centeredY + (style.fontSize * 0.8f);
+            float baselineY = centeredY;
+
+            Point2Di textPos(area.x - scrollOffset, baselineY);
+            ctx->DrawText(renderText, textPos);
+        }
+    }
+
+    void UltraCanvasTextInput::RenderPlaceholder(const Rect2Df &area, IRenderContext* ctx) {
+        ctx->SetTextAlignment(style.textAlignment);
+        ctx->SetTextVerticalAlignment((inputType == TextInputType::Multiline) ?
+            TextVerticalAlignment::Top : TextVerticalAlignment::Middle);
+        ctx->SetFontStyle(style.fontStyle);
+        ctx->SetTextPaint(style.placeholderColor);
+
+        ctx->DrawTextInRect(placeholderText, area);
+    }
+
+    void UltraCanvasTextInput::RenderSelection(const Rect2Df &area, IRenderContext* ctx) {
+        if (!HasSelection()) return;
+
+        std::string displayText = GetDisplayText();
+
+        // Set proper text style for measurement
+        ctx->SetFontStyle(style.fontStyle);
+
+        // Get text segments for accurate measurement
+        std::string textBeforeSelection = displayText.substr(0, selectionStart);
+        std::string selectedText = displayText.substr(selectionStart, selectionEnd - selectionStart);
+
+        float selStartX = area.x + ctx->GetTextLineWidth(textBeforeSelection);
+        float selWidth = ctx->GetTextLineWidth(selectedText);
+
+        // Calculate proper selection height based on font metrics
+        float ascender = style.fontStyle.fontSize * 0.8f;
+        float descender = style.fontStyle.fontSize * 0.2f;
+        float selectionHeight = ascender + descender;
+        float selectionY = area.y + (area.height - selectionHeight) / 2.0f;
+
+        // Ensure selection is within visible area
+        float visibleStartX = std::max(selStartX, area.x);
+        float visibleEndX = std::min(selStartX + selWidth, area.x + area.width);
+
+        if (visibleEndX > visibleStartX) {
+            Rect2Df selectionRect(visibleStartX, selectionY, visibleEndX - visibleStartX, selectionHeight);
+            ctx->SetFillPaint(style.selectionColor);
+            ctx->FillRectangle(selectionRect);
+        }
+    }
+
+    void UltraCanvasTextInput::RenderCaret(const Rect2Df &area, IRenderContext* ctx) {
+        if (!IsFocused() || !isCaretVisible) return;
+
+        // FIXED: Calculate X position to match text rendering exactly
+        Rect2Df textArea = GetTextArea();
+        float caretX;
+
+        if (text.empty() || caretPosition == 0) {
+            // When no text, caret should be at text start position
+            caretX = textArea.x - scrollOffset;
+        } else {
+            // Calculate width of text up to caret position
+            std::string displayText = GetDisplayText();
+            std::string textUpToCaret;
+
+            if (inputType == TextInputType::Multiline) {
+                // For multiline: find start of current line
+                size_t lineStart = caretPosition;
+                while (lineStart > 0 && displayText[lineStart - 1] != '\n') {
+                    lineStart--;
+                }
+                textUpToCaret = displayText.substr(lineStart, caretPosition - lineStart);
+            } else {
+                // For single line: text up to caret
+                textUpToCaret = displayText.substr(0, std::min(caretPosition, displayText.length()));
+            }
+
+            // Set text style for accurate measurement
+            ctx->SetFontStyle(style.fontStyle);
+
+            float textWidth = ctx->GetTextLineWidth(textUpToCaret);
+            // FIXED: Match text rendering position exactly
+            caretX = textArea.x + textWidth - scrollOffset;
+        }
+
+        float lineHeight = style.fontStyle.fontSize * 1.4f;
+        // Total height should be about lineHeight for visibility
+        float caretStartY = GetCaretYPosition();
+        float caretEndY = caretStartY + lineHeight;
+
+        // Only hide if completely outside control bounds
+        Rect2Di controlBounds = GetBounds();
+        if (caretX < controlBounds.x - 10 || caretX > controlBounds.x + controlBounds.width + 10) {
+            return;
+        }
+
+        ctx->SetStrokePaint(style.caretColor);
+        ctx->SetStrokeWidth(style.caretWidth);
+
+        // Draw caret line with proper height and position
+         ctx->DrawLine(
+                Point2Di(caretX, caretStartY),
+                Point2Di(caretX, caretEndY)
+        );
+    }
+
+    void UltraCanvasTextInput::RenderMultilineText(const Rect2Df &area, const std::string &displayText, const Point2Di &startPos, IRenderContext* ctx) {
+        // Split text into lines
+        std::vector<std::string> lines;
+        std::string currentLine;
+
+        for (char c : displayText) {
+            if (c == '\n') {
+                lines.push_back(currentLine);
+                currentLine.clear();
+            } else {
+                currentLine += c;
+            }
+        }
+        lines.push_back(currentLine);
+
+        float lineHeight = style.fontStyle.fontSize * 1.4f;
+        float currentBaselineY = startPos.y; // startPos.y is baseline
+
+        for (const auto& line : lines) {
+            if (currentBaselineY > area.y + area.height + lineHeight) break;
+            if (currentBaselineY >= area.y - lineHeight) {
+                ctx->DrawText(line, Point2Di(startPos.x, currentBaselineY));
+            }
+            currentBaselineY += lineHeight;
+        }
+    }
+
+    void UltraCanvasTextInput::RenderValidationFeedback(const Rect2Di &bounds, IRenderContext* ctx) const {
+        Color feedbackColor;
+
+        switch (lastValidationResult.state) {
+            case ValidationState::Valid:
+                feedbackColor = style.validBorderColor;
+                break;
+            case ValidationState::Invalid:
+                feedbackColor = style.invalidBorderColor;
+                break;
+            case ValidationState::Warning:
+                feedbackColor = style.warningBorderColor;
+                break;
+            default:
+                return;
+        }
+
+        // Draw validation border
+        ctx->SetStrokePaint(feedbackColor);
+        ctx->SetStrokeWidth(2.0f);
+        ctx->DrawRectangle(bounds);
+
+        // Draw validation icon (simplified)
+        if (lastValidationResult.state == ValidationState::Valid) {
+            // Draw checkmark
+            Point2Di iconPos(bounds.x + bounds.width - 20, bounds.y + bounds.height / 2);
+            ctx->SetStrokePaint(style.validBorderColor);
+            ctx->SetStrokeWidth(2.0f);
+            ctx->DrawLine(iconPos, Point2Di(iconPos.x + 4, iconPos.y + 4));
+            ctx->DrawLine(Point2Di(iconPos.x + 4, iconPos.y + 4), Point2Di(iconPos.x + 12, iconPos.y - 4));
+        } else if (lastValidationResult.state == ValidationState::Invalid) {
+            // Draw X
+            Point2Di iconPos(bounds.x + bounds.width - 20, bounds.y + bounds.height / 2 - 6);
+            ctx->SetStrokePaint(style.invalidBorderColor);
+            ctx->SetStrokeWidth(2.0f);
+            ctx->DrawLine(iconPos, Point2Di(iconPos.x + 12, iconPos.y + 12));
+            ctx->DrawLine(Point2Di(iconPos.x, iconPos.y + 12), Point2Di(iconPos.x + 12, iconPos.y));
+        }
+    }
+
+    void UltraCanvasTextInput::RenderClearButton(IRenderContext* ctx) {
+        if (!IsClearButtonVisible()) return;
+
+        Rect2Di btnBounds = GetClearButtonBounds();
+        if (btnBounds.width <= 0) return;
+
+        Color buttonColor = isClearButtonHovered ? clearButtonHoverColor : clearButtonColor;
+
+        Point2Di center(btnBounds.x + btnBounds.width / 2,
+                        btnBounds.y + btnBounds.height / 2);
+        int halfSize = clearButtonSize / 4;
+
+        ctx->SetStrokeWidth(1.5f);
+        ctx->SetLineCap(LineCap::Round);
+        ctx->SetStrokePaint(buttonColor);
+        ctx->DrawLine(Point2Di(center.x - halfSize, center.y - halfSize),
+                      Point2Di(center.x + halfSize, center.y + halfSize));
+        ctx->DrawLine(Point2Di(center.x + halfSize, center.y - halfSize),
+                      Point2Di(center.x - halfSize, center.y + halfSize));
+        ctx->SetStrokeWidth(1.0f);
+    }
+
+    void UltraCanvasTextInput::DrawShadow(const Rect2Di &bounds, IRenderContext* ctx) {
+        if (!style.showShadow) return;
+
+        Rect2Di shadowRect(
+                bounds.x + style.shadowOffset.x,
+                bounds.y + style.shadowOffset.y,
+                bounds.width,
+                bounds.height
+        );
+
+        ctx->SetStrokePaint(style.shadowColor);
+        ctx->DrawRectangle(shadowRect);
+    }
+
+    std::vector<std::string> UltraCanvasTextInput::SplitTextIntoLines(const std::string &text, float maxWidth) {
+        std::vector<std::string> lines;
+        std::istringstream stream(text);
+        std::string line;
+        auto ctx = GetRenderContext();
+        while (std::getline(stream, line)) {
+            if (ctx->GetTextLineWidth(line) <= maxWidth) {
+                lines.push_back(line);
+            } else {
+                // Word wrap logic
+                std::vector<std::string> wrappedLines = WrapLine(line, maxWidth);
+                lines.insert(lines.end(), wrappedLines.begin(), wrappedLines.end());
+            }
+        }
+
+        return lines;
+    }
+
+    std::vector<std::string> UltraCanvasTextInput::WrapLine(const std::string &line, float maxWidth) {
+        std::vector<std::string> wrappedLines;
+        std::istringstream words(line);
+        std::string word;
+        std::string currentLine;
+        auto ctx = GetRenderContext();
+
+        while (words >> word) {
+            std::string testLine = currentLine.empty() ? word : currentLine + " " + word;
+
+            if (ctx->GetTextLineWidth(testLine) <= maxWidth) {
+                currentLine = testLine;
+            } else {
+                if (!currentLine.empty()) {
+                    wrappedLines.push_back(currentLine);
+                    currentLine = word;
+                } else {
+                    // Single word is too long, break it
+                    wrappedLines.push_back(word);
+                }
+            }
+        }
+
+        if (!currentLine.empty()) {
+            wrappedLines.push_back(currentLine);
+        }
+
+        return wrappedLines;
+    }
+
+    size_t UltraCanvasTextInput::GetTextPositionFromPoint(const Point2Di& point) {
+        IRenderContext *ctx = GetRenderContext();
+
+        Rect2Df textArea = GetTextArea();
+
+        if (inputType == TextInputType::Multiline) {
+            // Calculate which line was clicked
+            float lineHeight = style.fontStyle.fontSize * 1.2f;
+            int clickedLine = static_cast<int>((point.y - textArea.y) / lineHeight);
+            clickedLine = std::max(0, clickedLine);
+
+            // Find the start position of the clicked line
+            std::string displayText = GetDisplayText();
+            size_t lineStartPos = 0;
+            int currentLine = 0;
+
+            for (size_t i = 0; i < displayText.length() && currentLine < clickedLine; i++) {
+                if (displayText[i] == '\n') {
+                    currentLine++;
+                    lineStartPos = i + 1;
+                }
+            }
+
+            // Find the end of the clicked line
+            size_t lineEndPos = displayText.find('\n', lineStartPos);
+            if (lineEndPos == std::string::npos) {
+                lineEndPos = displayText.length();
+            }
+
+            // Get the text of the clicked line
+            std::string lineText = displayText.substr(lineStartPos, lineEndPos - lineStartPos);
+
+            // CRITICAL: account for scroll offset
+            float relativeX = point.x - textArea.x + scrollOffset;
+
+            if (relativeX <= 0) return lineStartPos;
+
+            // Set text style for measurement
+            ctx->SetFontStyle(style.fontStyle);
+
+            // Binary search within the line
+            size_t left = 0, right = lineText.length();
+
+            while (left < right) {
+                size_t mid = (left + right) / 2;
+                std::string textToMid = lineText.substr(0, mid);
+                float widthToMid = ctx->GetTextLineWidth(textToMid);
+
+                if (widthToMid < relativeX) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+
+            return lineStartPos + std::min(left, lineText.length());
+        } else {
+            // Single line logic
+            if (point.y < textArea.y || point.y > textArea.y + textArea.height) {
+                return text.empty() ? 0 : text.length();
+            }
+
+            // CRITICAL: account for scroll offset
+            float relativeX = point.x - textArea.x + scrollOffset;
+
+            if (relativeX <= 0) return 0;
+
+            std::string displayText = GetDisplayText();
+
+            // Set text style for measurement
+            ctx->SetFontStyle(style.fontStyle);
+
+            // Binary search for position
+            size_t left = 0, right = displayText.length();
+
+            while (left < right) {
+                size_t mid = (left + right) / 2;
+                std::string textToMid = displayText.substr(0, mid);
+                float widthToMid = ctx->GetTextLineWidth(textToMid);
+
+                if (widthToMid < relativeX) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+
+            return std::min(left, displayText.length());
+        }
+    }
+
+    bool UltraCanvasTextInput::HandleMouseDown(const UCEvent &event) {
+        if (!Contains(event.x, event.y)) return false;
+
+        // Check clear button click first
+        if (IsClearButtonVisible()) {
+            Rect2Di clearBounds = GetClearButtonBounds();
+            if (clearBounds.Contains(event.x, event.y)) {
+                SaveState();
+                text.clear();
+                caretPosition = 0;
+                ClearSelection();
+                UpdateDisplayText();
+                UpdateScrollOffset();
+                isClearButtonHovered = false;
+                TextChanged();
+                if (onCleared) onCleared();
+                RequestRedraw();
+                return true;
+            }
+        }
+
+        SetFocus(true);
+
+        Point2Di clickPoint(event.x, event.y);
+        size_t clickPosition = GetTextPositionFromPoint(clickPoint);
+
+        if (event.shift && hasSelection) {
+            // Extend selection
+            SetSelection(selectionStart, clickPosition);
+        } else {
+            // Start new selection
+            SetCaretPosition(clickPosition);
+            isDragging = true;
+            dragStartPosition = clickPoint;
+        }
+        return true;
+    }
+
+    bool UltraCanvasTextInput::HandleMouseMove(const UCEvent &event) {
+        // Track clear button hover state
+        if (IsClearButtonVisible()) {
+            Rect2Di clearBounds = GetClearButtonBounds();
+            bool wasHovered = isClearButtonHovered;
+            isClearButtonHovered = clearBounds.Contains(event.x, event.y);
+            if (wasHovered != isClearButtonHovered) {
+                SetMouseCursor(isClearButtonHovered ? UCMouseCursor::Arrow : UCMouseCursor::Text);
+                RequestRedraw();
+            }
+        } else if (isClearButtonHovered) {
+            isClearButtonHovered = false;
+            SetMouseCursor(UCMouseCursor::Text);
+        }
+
+        if (!isDragging) return false;
+
+        Point2Di currentPoint(event.x, event.y);
+        size_t currentPosition = GetTextPositionFromPoint(currentPoint);
+        size_t startPosition = GetTextPositionFromPoint(dragStartPosition);
+
+        SetSelection(startPosition, currentPosition);
+        return true;
+    }
+
+    bool UltraCanvasTextInput::HandleMouseUp(const UCEvent &event) {
+        if (isDragging) {
+            isDragging = false;
+            return true;
+        }
+        return false;
+    }
+
+    bool UltraCanvasTextInput::HandleKeyDown(const UCEvent &event) {
+        if (readOnly) return false;
+
+        // Handle printable characters from KeyDown events
+        // UCEvent already has 'character' and 'text' fields populated by X11
+        if (event.character != 0 && event.character >= 32 && event.character < 127) {
+            // Handle regular printable character input
+            SaveState();
+
+            if (hasSelection) {
+                DeleteSelection();
+            }
+
+            std::string charStr(1, event.character);
+            InsertText(charStr);
+//            InvalidateLayout();
+            return true;
+        }
+
+        // Handle special keys
+        switch (event.virtualKey) {
+            case UCKeys::Return:
+                if (inputType == TextInputType::Multiline) {
+                    SaveState();
+                    if (hasSelection) DeleteSelection();
+                    InsertText("\n");
+                } else {
+                    if (onEnterPressed) onEnterPressed(text);
+                }
+                break;
+
+            case UCKeys::Escape:
+                if (onEscapePressed) onEscapePressed();
+                break;
+
+            case UCKeys::Backspace:
+                if (hasSelection) {
+                    SaveState();
+                    DeleteSelection();
+                } else if (caretPosition > 0) {
+                    SaveState();
+                    text.erase(caretPosition - 1, 1);
+                    caretPosition--;
+                    UpdateDisplayText();
+
+                }
+                UpdateScrollOffset();
+                TextChanged();
+                break;
+
+            case UCKeys::Delete:
+                if (hasSelection) {
+                    SaveState();
+                    DeleteSelection();
+                } else if (caretPosition < text.length()) {
+                    SaveState();
+                    text.erase(caretPosition, 1);
+                    UpdateDisplayText();
+                }
+                UpdateScrollOffset();
+                TextChanged();
+                break;
+
+            case UCKeys::Left:
+                if (event.shift) {
+                    if (!hasSelection) selectionStart = caretPosition;
+                    if (caretPosition > 0) caretPosition--;
+                    selectionEnd = caretPosition;
+                    hasSelection = true;
+                } else {
+                    if (caretPosition > 0) caretPosition--;
+                    ClearSelection();
+                }
+                UpdateScrollOffset();
+                break;
+
+            case UCKeys::Right:
+                if (event.shift) {
+                    if (!hasSelection) selectionStart = caretPosition;
+                    if (caretPosition < text.length()) caretPosition++;
+                    selectionEnd = caretPosition;
+                    hasSelection = true;
+                } else {
+                    if (caretPosition < text.length()) caretPosition++;
+                    ClearSelection();
+                }
+                UpdateScrollOffset();
+                break;
+
+            case UCKeys::Up:
+                if (inputType == TextInputType::Multiline) {
+                    // Handle multiline navigation
+                    if (event.shift) {
+                        if (!hasSelection) selectionStart = caretPosition;
+                        // Move up one line
+                        // ... multiline logic here
+                        hasSelection = true;
+                    } else {
+                        // Move up one line without selection
+                        // ... multiline logic here
+                        ClearSelection();
+                    }
+                }
+                break;
+
+            case UCKeys::Down:
+                if (inputType == TextInputType::Multiline) {
+                    // Handle multiline navigation
+                    if (event.shift) {
+                        if (!hasSelection) selectionStart = caretPosition;
+                        // Move down one line
+                        // ... multiline logic here
+                        hasSelection = true;
+                    } else {
+                        // Move down one line without selection
+                        // ... multiline logic here
+                        ClearSelection();
+                    }
+                }
+                break;
+
+            case UCKeys::Home:
+                if (event.shift) {
+                    if (!hasSelection) selectionStart = caretPosition;
+                    caretPosition = 0;
+                    selectionEnd = caretPosition;
+                    hasSelection = true;
+                } else {
+                    caretPosition = 0;
+                    ClearSelection();
+                }
+                UpdateScrollOffset();
+                break;
+
+            case UCKeys::End:
+                if (event.shift) {
+                    if (!hasSelection) selectionStart = caretPosition;
+                    caretPosition = text.length();
+                    selectionEnd = caretPosition;
+                    hasSelection = true;
+                } else {
+                    caretPosition = text.length();
+                    ClearSelection();
+                }
+                UpdateScrollOffset();
+                break;
+
+            case UCKeys::A:
+                if (event.ctrl) {
+                    SelectAll();
+                }
+                break;
+
+            case UCKeys::X:
+                if (event.ctrl && hasSelection) {
+                    CopyToClipboard(GetSelectedText());
+                    SaveState();
+                    DeleteSelection();
+                }
+                break;
+
+            case UCKeys::C:
+                if (event.ctrl && hasSelection) {
+                    CopyToClipboard(GetSelectedText());
+                }
+                break;
+
+            case UCKeys::V:
+                if (event.ctrl) {
+                    std::string clipboardText = GetFromClipboard();
+                    if (!clipboardText.empty()) {
+                        SaveState();
+                        if (hasSelection) DeleteSelection();
+                        InsertText(clipboardText);
+                    }
+                }
+                break;
+
+            case UCKeys::Z:
+                if (event.ctrl) {
+                    if (event.shift) {
+                        Redo();
+                    } else {
+                        Undo();
+                    }
+                }
+                break;
+
+            case UCKeys::Y:
+                if (event.ctrl) {
+                    Redo();
+                }
+                break;
+
+            case UCKeys::Tab:
+                if (inputType == TextInputType::Multiline) {
+                    SaveState();
+                    if (hasSelection) DeleteSelection();
+                    InsertText("\t");
+                }
+                // Otherwise let Tab navigate to next control
+                break;
+
+            case UCKeys::Space:
+                // Handle space as a regular character
+                SaveState();
+                if (hasSelection) DeleteSelection();
+                InsertText(" ");
+                break;
+
+            default:
+                // Check if it's a printable character using event.text field
+                if (!event.text.empty()) {
+                    // Filter to only allow printable characters
+                    std::string filteredText;
+                    for (char c : event.text) {
+                        if (c >= 32 && c < 127) { // Printable ASCII
+                            filteredText += c;
+                        }
+                    }
+
+                    if (!filteredText.empty()) {
+                        SaveState();
+                        if (hasSelection) DeleteSelection();
+                        InsertText(filteredText);
+                    }
+                }
+                break;
+        }
+
+        return true;
+    }
+
+    bool UltraCanvasTextInput::HandleFocusGained(const UCEvent &event) {
+        SetFocus(true);
+        isCaretVisible = true;
+        caretBlinkTimer = 0.0f;
+//        InvalidateLayout();
+
+        if (onFocusGained) onFocusGained();
+        return true;
+    }
+
+    bool UltraCanvasTextInput::HandleFocusLost(const UCEvent &event) {
+        isCaretVisible = false;
+        isDragging = false;
+        isClearButtonHovered = false;
+//        InvalidateLayout();
+
+        if (onFocusLost) onFocusLost();
+        return true;
+    }
+
+    void UltraCanvasTextInput::InsertText(const std::string &insertText) {
+        if (readOnly) return;
+
+        SaveState();
+
+        // Check max length
+        if (maxLength > 0 && static_cast<int>(text.length() + insertText.length()) > maxLength) {
+            return;
+        }
+
+        // Delete selection if any
+        if (hasSelection) {
+            text.erase(selectionStart, selectionEnd - selectionStart);
+            caretPosition = selectionStart;
+            ClearSelection();
+        }
+
+        // Insert new text
+        text.insert(caretPosition, insertText);
+        caretPosition += insertText.length();
+
+        UpdateDisplayText();
+        UpdateScrollOffset();
+
+        if (validateOnChange) {
+            Validate();
+        }
+
+        TextChanged();
+    }
+
+    void UltraCanvasTextInput::DeleteSelection() {
+        if (!hasSelection) return;
+
+        SaveState();
+
+        text.erase(selectionStart, selectionEnd - selectionStart);
+        caretPosition = selectionStart;
+        ClearSelection();
+
+        UpdateDisplayText();
+        UpdateScrollOffset();
+
+        if (validateOnChange) {
+            Validate();
+        }
+
+        TextChanged();
+    }
+
+    void UltraCanvasTextInput::UpdateDisplayText() {
+        displayText = formatter.formatFunction ? formatter.formatFunction(text) : text;
+        RequestRedraw();
+    }
+
+    void UltraCanvasTextInput::CopyToClipboard(const std::string &text) {
+        // Platform-specific clipboard implementation needed
+    }
+
+    std::string UltraCanvasTextInput::GetFromClipboard() {
+        // Platform-specific clipboard implementation needed
+        return "";
+    }
+
+    int UltraCanvasTextInput::GetCaretLineNumber() const {
+        if (inputType != TextInputType::Multiline) return 0;
+
+        std::string displayText = GetDisplayText();
+        int lineNumber = 0;
+
+        for (size_t i = 0; i < caretPosition && i < displayText.length(); i++) {
+            if (displayText[i] == '\n') {
+                lineNumber++;
+            }
+        }
+
+        return lineNumber;
+    }
+
+    float UltraCanvasTextInput::GetLineYPosition(int lineNumber) const {
+        Rect2Df textArea = GetTextArea();
+        float lineHeight = style.fontStyle.fontSize * 1.2f;
+        return textArea.y + (lineNumber * lineHeight);
+    }
+
+    float UltraCanvasTextInput::GetCaretXInLine() const {
+        auto ctx = GetRenderContext();
+        if (text.empty() || caretPosition == 0) {
+            return style.paddingLeft;
+        }
+
+        std::string displayText = GetDisplayText();
+
+        // Find start of current line
+        size_t lineStart = caretPosition;
+        while (lineStart > 0 && displayText[lineStart - 1] != '\n') {
+            lineStart--;
+        }
+
+        // Get text from line start to caret
+        std::string textInLine = displayText.substr(lineStart, caretPosition - lineStart);
+
+        // Set text style for measurement
+        ctx->SetFontStyle(style.fontStyle);
+
+        float textWidth = ctx->GetTextLineWidth(textInLine);
+        return style.paddingLeft + textWidth;
+    }
+
+    float UltraCanvasTextInput::GetCaretXPosition() {
+        auto ctx = GetRenderContext();
+        if (text.empty() || caretPosition == 0) {
+            return style.paddingLeft;
+        }
+
+        std::string displayText = GetDisplayText();
+
+        if (inputType == TextInputType::Multiline) {
+            // For multiline: find start of current line
+            size_t lineStart = caretPosition;
+            while (lineStart > 0 && displayText[lineStart - 1] != '\n') {
+                lineStart--;
+            }
+
+            // Get text from line start to caret
+            std::string textInLine = displayText.substr(lineStart, caretPosition - lineStart);
+
+            // Set text style for measurement
+            ctx->SetFontStyle(style.fontStyle);
+
+            float textWidth = ctx->GetTextLineWidth(textInLine);
+            return style.paddingLeft + textWidth;
+        } else {
+            // For single line: measure text up to caret
+            std::string textUpToCaret = displayText.substr(0, std::min(caretPosition, displayText.length()));
+
+            // Set text style for measurement
+            ctx->SetFontStyle(style.fontStyle);
+
+            float textWidth = ctx->GetTextLineWidth(textUpToCaret);
+            return style.paddingLeft + textWidth;
+        }
+    }
+
+    float UltraCanvasTextInput::GetCaretYPosition() {
+        Rect2Df textArea = GetTextArea();
+
+        if (inputType == TextInputType::Multiline) {
+            // Count line number where caret is
+            std::string displayText = GetDisplayText();
+            int lineNumber = 0;
+
+            for (size_t i = 0; i < caretPosition && i < displayText.length(); i++) {
+                if (displayText[i] == '\n') {
+                    lineNumber++;
+                }
+            }
+
+            float lineHeight = style.fontStyle.fontSize * 1.2f;
+            // CRITICAL: Return baseline position, not top of line
+            return textArea.y + (lineNumber * lineHeight) + (style.fontStyle.fontSize * 0.8f);
+        } else {
+            // Single line: match baseline positioning
+            float lineHeight = style.fontStyle.fontSize * 1.2f;
+            float centeredY = textArea.y + (textArea.height - lineHeight) / 2.0f;
+            return centeredY;
+        }
+    }
+
+    ValidationRule ValidationRule::Required(const std::string &message) {
+        return ValidationRule("Required", message, [](const std::string& value) {
+            return !value.empty();
+        }, true);
+    }
+
+    ValidationRule ValidationRule::MinLength(int minLen, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must be at least " + std::to_string(minLen) + " characters" : message;
+        return ValidationRule("MinLength", msg, [minLen](const std::string& value) {
+            return value.length() >= static_cast<size_t>(minLen);
+        });
+    }
+
+    ValidationRule ValidationRule::MaxLength(int maxLen, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must be no more than " + std::to_string(maxLen) + " characters" : message;
+        return ValidationRule("MaxLength", msg, [maxLen](const std::string& value) {
+            return value.length() <= static_cast<size_t>(maxLen);
+        });
+    }
+
+    ValidationRule ValidationRule::Email(const std::string &message) {
+        return ValidationRule("Email", message, [](const std::string& value) {
+            std::regex emailRegex(R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})");
+            return std::regex_match(value, emailRegex);
+        });
+    }
+
+    ValidationRule ValidationRule::Phone(const std::string &message) {
+        return ValidationRule("Phone", message, [](const std::string& value) {
+            std::regex phoneRegex(R"(\+?[\d\s\-\(\)\.]{10,})");
+            return std::regex_match(value, phoneRegex);
+        });
+    }
+
+    ValidationRule ValidationRule::Numeric(const std::string &message) {
+        return ValidationRule("Numeric", message, [](const std::string& value) {
+            try {
+                std::stod(value);
+                return true;
+            } catch (...) {
+                return false;
+            }
+        });
+    }
+
+    ValidationRule ValidationRule::Range(double min, double max, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must be between " + std::to_string(min) + " and " + std::to_string(max) : message;
+        return ValidationRule("Range", msg, [min, max](const std::string& value) {
+            try {
+                double val = std::stod(value);
+                return val >= min && val <= max;
+            } catch (...) {
+                return false;
+            }
+        });
+    }
+
+    ValidationRule ValidationRule::Pattern(const std::string &pattern, const std::string &message) {
+        return ValidationRule("Pattern", message, [pattern](const std::string& value) {
+            try {
+                std::regex regex(pattern);
+                return std::regex_match(value, regex);
+            } catch (...) {
+                return false;
+            }
+        });
+    }
+
+    ValidationRule ValidationRule::RequireUppercase(int minCount, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must contain at least " + std::to_string(minCount) + " uppercase letter" + (minCount > 1 ? "s" : "") : message;
+        return ValidationRule("RequireUppercase", msg, [minCount](const std::string& value) {
+            int count = 0;
+            for (char c : value) {
+                if (c >= 'A' && c <= 'Z') count++;
+                if (count >= minCount) return true;
+            }
+            return false;
+        });
+    }
+
+    ValidationRule ValidationRule::RequireLowercase(int minCount, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must contain at least " + std::to_string(minCount) + " lowercase letter" + (minCount > 1 ? "s" : "") : message;
+        return ValidationRule("RequireLowercase", msg, [minCount](const std::string& value) {
+            int count = 0;
+            for (char c : value) {
+                if (c >= 'a' && c <= 'z') count++;
+                if (count >= minCount) return true;
+            }
+            return false;
+        });
+    }
+
+    ValidationRule ValidationRule::RequireDigit(int minCount, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must contain at least " + std::to_string(minCount) + " digit" + (minCount > 1 ? "s" : "") : message;
+        return ValidationRule("RequireDigit", msg, [minCount](const std::string& value) {
+            int count = 0;
+            for (char c : value) {
+                if (c >= '0' && c <= '9') count++;
+                if (count >= minCount) return true;
+            }
+            return false;
+        });
+    }
+
+    ValidationRule ValidationRule::RequireSpecialChar(int minCount, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must contain at least " + std::to_string(minCount) + " special character" + (minCount > 1 ? "s" : "") : message;
+        return ValidationRule("RequireSpecialChar", msg, [minCount](const std::string& value) {
+            const std::string specialChars = "!@#$%^&*()_+-=[]{}|;:,.<>?/~`'\"\\";
+            int count = 0;
+            for (char c : value) {
+                if (specialChars.find(c) != std::string::npos) count++;
+                if (count >= minCount) return true;
+            }
+            return false;
+        });
+    }
+
+    ValidationRule ValidationRule::NoRepeatingChars(int maxRepeat, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must not contain more than " + std::to_string(maxRepeat) + " repeating characters" : message;
+        return ValidationRule("NoRepeatingChars", msg, [maxRepeat](const std::string& value) {
+            if (value.empty()) return true;
+
+            int count = 1;
+            char prevChar = value[0];
+            for (size_t i = 1; i < value.length(); i++) {
+                if (value[i] == prevChar) {
+                    count++;
+                    if (count > maxRepeat) return false;
+                } else {
+                    count = 1;
+                    prevChar = value[i];
+                }
+            }
+            return true;
+        });
+    }
+
+    ValidationRule ValidationRule::NoSequentialChars(int maxSequence, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Must not contain more than " + std::to_string(maxSequence) + " sequential characters" : message;
+        return ValidationRule("NoSequentialChars", msg, [maxSequence](const std::string& value) {
+            if (value.length() < 2) return true;
+
+            int ascCount = 1;
+            int descCount = 1;
+
+            for (size_t i = 1; i < value.length(); i++) {
+                // Check ascending sequence
+                if (value[i] == value[i-1] + 1) {
+                    ascCount++;
+                    if (ascCount > maxSequence) return false;
+                    descCount = 1;
+                }
+                    // Check descending sequence
+                else if (value[i] == value[i-1] - 1) {
+                    descCount++;
+                    if (descCount > maxSequence) return false;
+                    ascCount = 1;
+                }
+                else {
+                    ascCount = 1;
+                    descCount = 1;
+                }
+            }
+            return true;
+        });
+    }
+
+    ValidationRule ValidationRule::NoCommonPasswords(const std::string &message) {
+        return ValidationRule("NoCommonPasswords", message, [](const std::string& value) {
+            // List of most common passwords (expandable)
+            static const std::vector<std::string> commonPasswords = {
+                    "password", "123456", "123456789", "12345678", "12345", "1234567",
+                    "password1", "qwerty", "abc123", "111111", "123123", "admin",
+                    "letmein", "welcome", "monkey", "dragon", "master", "sunshine",
+                    "princess", "football", "iloveyou", "123321", "starwars", "654321"
+            };
+
+            // Convert to lowercase for comparison
+            std::string lowerValue = value;
+            std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(), ::tolower);
+
+            for (const auto& common : commonPasswords) {
+                if (lowerValue == common) return false;
+            }
+            return true;
+        });
+    }
+
+    ValidationRule
+    ValidationRule::NoUserInfo(const std::string &username, const std::string &email, const std::string &message) {
+        std::string msg = message.empty() ?
+                          "Password must not contain username or email" : message;
+        return ValidationRule("NoUserInfo", msg, [username, email](const std::string& value) {
+            // Convert all to lowercase for comparison
+            std::string lowerValue = value;
+            std::string lowerUsername = username;
+            std::string lowerEmail = email;
+
+            std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(), ::tolower);
+            std::transform(lowerUsername.begin(), lowerUsername.end(), lowerUsername.begin(), ::tolower);
+            std::transform(lowerEmail.begin(), lowerEmail.end(), lowerEmail.begin(), ::tolower);
+
+            // Check if password contains username
+            if (!lowerUsername.empty() && lowerValue.find(lowerUsername) != std::string::npos) {
+                return false;
+            }
+
+            // Check if password contains email (or email prefix)
+            if (!lowerEmail.empty()) {
+                size_t atPos = lowerEmail.find('@');
+                std::string emailPrefix = (atPos != std::string::npos) ? lowerEmail.substr(0, atPos) : lowerEmail;
+                if (lowerValue.find(emailPrefix) != std::string::npos) {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+    }
+
+    float ValidationRule::CalculatePasswordStrength(const std::string &password) {
+        if (password.empty()) return 0.0f;
+
+        float strength = 0.0f;
+
+        // Length score (0-30 points)
+        int length = password.length();
+        if (length >= 6) strength += 10.0f;
+        if (length >= 8) strength += 10.0f;
+        if (length >= 12) strength += 10.0f;
+        if (length >= 16) strength += 10.0f;
+
+        // Character variety (0-40 points)
+        bool hasUpper = false, hasLower = false, hasDigit = false, hasSpecial = false;
+        for (char c : password) {
+            if (c >= 'A' && c <= 'Z') hasUpper = true;
+            if (c >= 'a' && c <= 'z') hasLower = true;
+            if (c >= '0' && c <= '9') hasDigit = true;
+            if (!isalnum(c)) hasSpecial = true;
+        }
+        if (hasUpper) strength += 15.0f;
+        if (hasLower) strength += 10.0f;
+        if (hasDigit) strength += 10.0f;
+        if (hasSpecial) strength += 15.0f;
+
+        // Pattern complexity (0-30 points)
+        // Check for repeating characters
+        bool hasRepeats = false;
+        for (size_t i = 1; i < password.length(); i++) {
+            if (password[i] == password[i-1]) {
+                hasRepeats = true;
+                break;
+            }
+        }
+        if (!hasRepeats) strength += 10.0f;
+
+        // Check for sequential characters
+        bool hasSequential = false;
+        for (size_t i = 1; i < password.length(); i++) {
+            if (password[i] == password[i-1] + 1 || password[i] == password[i-1] - 1) {
+                hasSequential = true;
+                break;
+            }
+        }
+        if (!hasSequential) strength += 10.0f;
+
+        // Unique character ratio
+//        std::unordered_set<char> uniqueChars(password.begin(), password.end());
+//        float uniqueRatio = static_cast<float>(uniqueChars.size()) / password.length();
+//        if (uniqueRatio > 0.7f) strength += 10.0f;
+
+        // Clamp to 0-100
+        return std::min(100.0f, std::max(0.0f, strength));
+    }
+
+    std::string ValidationRule::GetPasswordStrengthLevel(float strength) {
+        if (strength < 20.0f) return "Very Weak";
+        if (strength < 40.0f) return "Weak";
+        if (strength < 60.0f) return "Fair";
+        if (strength < 80.0f) return "Good";
+        if (strength < 95.0f) return "Strong";
+        return "Very Strong";
+    }
+
+    Color ValidationRule::GetPasswordStrengthColor(float strength) {
+        if (strength < 20.0f) return Color(220, 53, 69);   // Red
+        if (strength < 40.0f) return Color(255, 107, 0);   // Dark Orange
+        if (strength < 60.0f) return Color(255, 193, 7);   // Yellow
+        if (strength < 80.0f) return Color(163, 203, 56);  // Lime
+        if (strength < 95.0f) return Color(40, 167, 69);   // Green
+        return Color(25, 135, 84);                          // Dark Green
+    }
+}
